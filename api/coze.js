@@ -1,4 +1,22 @@
 // api/coze.js
+const DEBUG = (req) => String(req.headers['x-debug'] || '') === '1';
+
+// 在 try { if (stream) { ... } } 里面的流式分支，for await 或 reader.read() 循环中加：
+// 情况1：AsyncIterable
+for await (const chunk of s) {
+  if (DEBUG(req)) console.log('[coze-chunk]', chunk);
+  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+// 情况2：ReadableStream
+const reader = s.getReader();
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  const text = typeof value === 'string' ? value : Buffer.from(value).toString('utf-8');
+  if (DEBUG(req)) console.log('[coze-chunk-text]', text);
+  res.write(`data: ${text}\n\n`);
+}
+
 const crypto = require('crypto');
 
 // 你也可以通过环境变量切换到 https://api.coze.com
