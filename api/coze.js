@@ -1,23 +1,33 @@
 // api/coze.js
 const crypto = require('crypto');
 
+// 你也可以通过环境变量切换到 https://api.coze.com
 const DEFAULT_COZE_BASE = process.env.COZE_BASE_URL || 'https://api.coze.cn';
+
 const DEBUG = (req) => String(req.headers['x-debug'] || '') === '1';
 
-function allowOrigins() {
+function getAllowedOrigins() {
   return (process.env.ALLOWED_ORIGINS || '')
-    .split(',').map(s => s.trim()).filter(Boolean);
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 }
-function setCors(res, origin) {
-  const allow = allowOrigins();
-  const o = allow.length ? (origin && allow.includes(origin) ? origin : allow[0]) : '*';
-  res.setHeader('Access-Control-Allow-Origin', o || '*');
+
+function setCors(res, reqOrigin) {
+  const allowed = getAllowedOrigins();
+  const origin =
+    allowed.length === 0
+      ? '*'
+      : (reqOrigin && allowed.includes(reqOrigin) ? reqOrigin : allowed[0]);
+
+  res.setHeader('Access-Control-Allow-Origin', origin || '*');
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-App-Auth, X-Debug');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-App-Auth');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
-function verifyShared(req) {
+
+function verifyAppAuth(req) {
   const secret = process.env.APP_SHARED_SECRET;
   if (!secret) return true;
   const hdr = req.headers['x-app-auth'];
@@ -30,34 +40,97 @@ function verifyShared(req) {
 
 module.exports = async (req, res) => {
   setCors(res, req.headers.origin);
+
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
-  if (!verifyShared(req)) return res.status(401).json({ error: 'Unauthorized' });
+  if (!verifyAppAuth(req)) return res.status(401).json({ error: 'Unauthorized' });
 
+  // 解析输入
   let body = {};
-  try { body = req.body || {}; } catch { return res.status(400).json({ error: 'Invalid JSON body' }); }
-
-  const { bot_id, user_id, additional_messages, conversation_id, stream = true } = body;
-  if (!bot_id || !user_id || !Array.isArray(additional_messages)) {
-    return res.status(400).json({ error: 'Missing fields: bot_id, user_id, additional_messages[]' });
+  try {
+    body = req.body || {};
+  } catch {
+    return res.status(400).json({ error: 'Invalid JSON body' });
   }
+
+  const {
+    bot_id,
+    user_id,
+    additional_messages,
+    conversation_id, // 可选
+    // 允许前端传 stream=true/false；不传默认走流式
+    stream = true
+  } = body;
+
+  if (!bot_id || !user_id || !Array.isArray(additional_messages)) {
+    return res.status(400).json({
+      error: 'Missing required fields: bot_id, user_id, additional_messages[]'
+    });
+  }
+
   const token = process.env.COZE_API_KEY;
   if (!token) return res.status(500).json({ error: 'COZE_API_KEY is not configured' });
 
-  // 动态导入官方 SDK（ESM 包）
-  let CozeAPI;
-  try {
-    ({ CozeAPI } = await import('@coze/api'));
-  } catch (e) {
-    const msg = 'Failed to import @coze/api';
-    if (DEBUG(req)) return res.status(500).json({ error: msg, detail: String(e?.stack || e) });
-    return res.status(500).json({ error: msg });
-  }
+  const baseURL = DEFAULT_COZE_BASE; // 也可从 req.headers['x-coze-base'] 读取覆盖
 
-  const api = new CozeAPI({ token, baseURL: DEFAULT_COZE_BASE });
+  // 动态导入官方 SDK（其包为 ESM，CJS 里用 dynamic import 最稳妥）
+  const { CozeAPI } = await import('@coze/api');
+
+  const api = new CozeAPI({
+    token,
+    baseURL // 例：'https://api.coze.cn' 或 'https://api.coze.com'
+  });
 
   try {
     if (stream) {
+      // ====== 流式：把 SDK 的流逐段写成 SSE ======
+      const s = await api.chat.stream({
+        bot_id,
+        user_id,
+        additional_messages,
+        // SDK 是否支持传 conversation_id：如支持可按需带上
+        ...(conversation_id ? { conversation_id } : {})
+      });
+
+      // 设置 SSE 响应头
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+
+      // 情况1：SDK 返回 AsyncIterable
+      if (s && typeof s[Symbol.asyncIterator] === 'function') {
+        for await (const chunk of s) {
+          // 直接把每个事件对象包装为 SSE
+          if (DEBUG(req)) console.log('[coze-chunk]', chunk);
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        }
+        res.write(`data: [DONE]\n\n`);
+        return res.end();
+      }
+
+      // 情况2：SDK 返回 Web ReadableStream
+      if (s && s.getReader) {
+        const reader = s.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          // 假设 value 是 Uint8Array 或字符串
+          const text = typeof value === 'string' ? value : Buffer.from(value).toString('utf-8');
+          // 如果 SDK 已经产出了 SSE 格式，也可以直接写入；这里稳妥起见包一层 data:
+          if (DEBUG(req)) console.log('[coze-chunk-text]', text);
+          res.write(`data: ${text}\n\n`);
+        }
+        res.write(`data: [DONE]\n\n`);
+        return res.end();
+      }
+
+      // 情况3：无法识别的返回（兜底）
+      res.write(`data: ${JSON.stringify({ notice: 'unknown stream payload' })}\n\n`);
+      res.write(`data: [DONE]\n\n`);
+      return res.end();
+    } else {
+      // ====== 非流式（同步拿完整结果）======
+      // 如果 SDK 有非流式方法（如 api.chat.create），你可以替换为相应方法
       const s = await api.chat.stream({
         bot_id,
         user_id,
@@ -65,63 +138,28 @@ module.exports = async (req, res) => {
         ...(conversation_id ? { conversation_id } : {})
       });
 
-      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('Connection', 'keep-alive');
-
-      // 1) AsyncIterable
+      // 收集完整输出返回 JSON（作为兜底兼容）
+      const chunks = [];
       if (s && typeof s[Symbol.asyncIterator] === 'function') {
-        for await (const chunk of s) {
-          console.log('[coze-chunk-iterable]', chunk);
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        }
-        res.write('data: [DONE]\n\n'); return res.end();
-      }
-
-      // 2) Web ReadableStream
-      if (s && typeof s.getReader === 'function') {
+        for await (const chunk of s) chunks.push(chunk);
+      } else if (s && s.getReader) {
         const reader = s.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          const text = Buffer.isBuffer(value) ? value.toString('utf-8')
-                     : value?.constructor?.name === 'Uint8Array' ? Buffer.from(value).toString('utf-8')
-                     : typeof value === 'string' ? value
-                     : '';
-          console.log('[coze-chunk-reader]', text);
-          // SDK若已经是JSON片段，就直接包data:；否则原样透传
-          res.write(`data: ${text}\n\n`);
+          buf += decoder.decode(value, { stream: true });
         }
-        res.write('data: [DONE]\n\n'); return res.end();
+        chunks.push({ raw: buf });
       }
-
-      // 3) 兜底：不认识的结构
-      if (DEBUG(req)) console.log('[coze-unknown-stream]', typeof s, Object.keys(s||{}));
-      res.write(`data: ${JSON.stringify({ notice: 'unknown stream payload' })}\n\n`);
-      res.write('data: [DONE]\n\n'); return res.end();
+      return res.status(200).json({ ok: true, chunks });
     }
-
-    // 非流式：把增量收集后一次性返回，便于排错
-    const s = await api.chat.stream({
-      bot_id, user_id, additional_messages, ...(conversation_id ? { conversation_id } : {})
-    });
-    const chunks = [];
-
-    if (s && typeof s[Symbol.asyncIterator] === 'function') {
-      for await (const c of s) chunks.push(c);
-    } else if (s && typeof s.getReader === 'function') {
-      const reader = s.getReader(); const decoder = new TextDecoder(); let buf = '';
-      while (true) { const { done, value } = await reader.read(); if (done) break;
-        buf += decoder.decode(value, { stream: true }); }
-      chunks.push({ raw: buf });
-    } else {
-      chunks.push({ notice: 'unknown non-stream payload' });
-    }
-    return res.status(200).json({ ok: true, chunks });
-
   } catch (e) {
-    const payload = { error: 'Coze API call failed', detail: String(e?.message || e) };
-    if (DEBUG(req)) payload.stack = String(e?.stack || '');
-    return res.status(502).json(payload);
+    // 上游/SDK 抛错
+    return res.status(502).json({
+      error: 'Coze API call failed',
+      detail: String(e?.message || e)
+    });
   }
 };
