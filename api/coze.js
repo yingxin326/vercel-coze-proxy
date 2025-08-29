@@ -72,7 +72,7 @@ module.exports = async (req, res) => {
       // 1) AsyncIterable
       if (s && typeof s[Symbol.asyncIterator] === 'function') {
         for await (const chunk of s) {
-          if (DEBUG(req)) console.log('[coze-chunk-iterable]', chunk);
+          console.log('[coze-chunk-iterable]', chunk);
           res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         }
         res.write('data: [DONE]\n\n'); return res.end();
@@ -88,7 +88,7 @@ module.exports = async (req, res) => {
                      : value?.constructor?.name === 'Uint8Array' ? Buffer.from(value).toString('utf-8')
                      : typeof value === 'string' ? value
                      : '';
-          if (DEBUG(req)) console.log('[coze-chunk-reader]', text);
+          console.log('[coze-chunk-reader]', text);
           // SDK若已经是JSON片段，就直接包data:；否则原样透传
           res.write(`data: ${text}\n\n`);
         }
